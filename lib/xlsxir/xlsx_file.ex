@@ -2,7 +2,7 @@ defmodule Xlsxir.XlsxFile do
   @moduledoc """
   Struct and helper functions to extract and process `.xslx` files
 
-  ## Example
+  ## Example
 
     iex> xlsx_file = Xlsxir.XlsxFile.initialize("./test/test_data/test.xlsx")
     iex> {:ok, _tid} = Xlsxir.XlsxFile.parse_to_ets(xlsx_file, 0)
@@ -115,7 +115,7 @@ defmodule Xlsxir.XlsxFile do
 
   defp fill_empty_cells_at_end(tid, end_column, index) when is_integer(index) do
     build_and_replace(tid, end_column, index)
-    nex_index= :ets.next(tid, index)
+    nex_index = :ets.next(tid, index)
     fill_empty_cells_at_end(tid, end_column, nex_index)
   end
 
@@ -133,7 +133,7 @@ defmodule Xlsxir.XlsxFile do
     empty_cells = Xlsxir.ParseWorksheet.fill_empty_cells(from, to, index, [])
     new_cells = cells ++ empty_cells
 
-    true = :ets.insert(tid, {index,  new_cells})
+    true = :ets.insert(tid, {index, new_cells})
   end
 
   @doc """
@@ -142,9 +142,14 @@ defmodule Xlsxir.XlsxFile do
   and `[{:ok, worksheet_1_table_id, time1}, ..., {:ok, worksheet_n_table_id, timen}]` when `timer` is `true`
   """
   def parse_all_to_ets(%__MODULE__{} = xlsx_file, timer \\ false) do
+    # Sort worksheets properly by ordering sheet names numerically
     xlsx_file.worksheet_xml_files
-    # Sort worksheets by name (i.e. index)
-    |> Enum.sort(&(&1.name <= &2.name))
+    |> Enum.sort_by(fn xml_file ->
+      case Regex.run(~r/sheet(\d+)\.xml/, xml_file.name, capture: :all_but_first) do
+        [num_str] -> String.to_integer(num_str)
+        _ -> 999 # Put non-matching sheets at the end
+      end
+    end)
     |> Enum.map(&parse_to_ets(xlsx_file, &1, timer))
   end
 
@@ -197,9 +202,19 @@ defmodule Xlsxir.XlsxFile do
   end
 
   defp initialize_stream(%__MODULE__{} = xlsx_file, worksheet_index) do
-    {:ok, worksheet_xml_file} = get_worksheet(xlsx_file, worksheet_index)
-    sax_parser_pid = spawn(__MODULE__, :parse_worksheet_loop, [worksheet_xml_file, xlsx_file])
-    {sax_parser_pid, xlsx_file}
+    case get_worksheet(xlsx_file, worksheet_index) do
+      {:ok, worksheet_xml_file} ->
+        sax_parser_pid = spawn(__MODULE__, :parse_worksheet_loop, [worksheet_xml_file, xlsx_file])
+        {sax_parser_pid, xlsx_file}
+      {:error, reason} ->
+        # Return a tuple that makes sense for stream processing
+        {nil, {:error, reason}}
+    end
+  end
+
+  defp initialize_stream({:error, _reason} = error, _worksheet_index) do
+    # Return a tuple that will be properly handled by stream_next_row
+    {nil, error}
   end
 
   @doc false
@@ -207,7 +222,7 @@ defmodule Xlsxir.XlsxFile do
     SaxParser.parse(worksheet_xml_file, :stream_worksheet, xlsx_file)
   end
 
-  defp stream_next_row({sax_parser_pid, _xlsx_file} = stream_state) do
+  defp stream_next_row({sax_parser_pid, _xlsx_file} = stream_state) when is_pid(sax_parser_pid) do
     # Ask next row to the xml parser process
     send(sax_parser_pid, {:get_next_row, self()})
 
@@ -221,10 +236,20 @@ defmodule Xlsxir.XlsxFile do
     end
   end
 
-  defp clean_stream({sax_parser_pid, xlsx_file}) do
+  defp stream_next_row({nil, {:error, _error_reason}} = stream_state) do
+    # We got an error during initialization, halt the stream
+    {:halt, stream_state}
+  end
+
+  defp clean_stream({sax_parser_pid, xlsx_file}) when is_pid(sax_parser_pid) do
     # Kill parser loop process and remove common ETS tables
     Process.exit(sax_parser_pid, :kill)
     clean(xlsx_file)
+  end
+
+  defp clean_stream({nil, {:error, _error_reason}}) do
+    # No resources to clean
+    :ok
   end
 
   defp extract_all_xml_files(%__MODULE__{} = xlsx_file, xlsx_filepath) do
@@ -256,8 +281,8 @@ defmodule Xlsxir.XlsxFile do
 
   defp zip_paths_list(worksheet_indexes) do
     worksheet_indexes
-    |> Enum.map(fn worksheet_index -> 'xl/worksheets/sheet#{worksheet_index + 1}.xml' end)
-    |> Enum.concat(['xl/styles.xml', 'xl/sharedStrings.xml', 'xl/workbook.xml'])
+    |> Enum.map(fn worksheet_index -> "xl/worksheets/sheet#{worksheet_index + 1}.xml" |> String.to_charlist() end)
+    |> Enum.concat(["xl/styles.xml", "xl/sharedStrings.xml", "xl/workbook.xml"] |> Enum.map(&String.to_charlist/1))
   end
 
   defp parse_styles_to_ets(%__MODULE__{styles_xml_file: nil} = xlsx_file), do: xlsx_file
@@ -294,14 +319,36 @@ defmodule Xlsxir.XlsxFile do
   defp parse_shared_strings_to_ets({:error, _} = error), do: error
 
   defp get_worksheet(%__MODULE__{} = xlsx_file, index) do
-    xml_file =
-      Enum.find(xlsx_file.worksheet_xml_files, fn xml_file ->
-        xml_file.name == "sheet#{index + 1}.xml"
-      end)
-
-    case xml_file do
-      nil -> {:error, "Invalid worksheet index."}
-      %XmlFile{} -> {:ok, xml_file}
+    # Determine the filename based on the index (0-based to 1-based)
+    target_filename = "sheet#{index + 1}.xml"
+    
+    # First try to find by exact filename match
+    found_file = Enum.find(xlsx_file.worksheet_xml_files, fn xml_file ->
+      xml_file.name == target_filename
+    end)
+    
+    # Return the result
+    case found_file do
+      nil -> 
+        # If we couldn't find by name, try to find by position in the list
+        # (some Excel files may use unusual naming patterns)
+        if index < length(xlsx_file.worksheet_xml_files) do
+          # Sort the worksheets by their numeric index first
+          sorted_files = Enum.sort_by(xlsx_file.worksheet_xml_files, fn file ->
+            case Regex.run(~r/sheet(\d+)\.xml/, file.name, capture: :all_but_first) do
+              [num_str] -> String.to_integer(num_str)
+              _ -> 999 # Put non-matching sheets at the end
+            end
+          end)
+          
+          # Get the file at the requested position
+          file_at_position = Enum.at(sorted_files, index)
+          if file_at_position, do: {:ok, file_at_position}, else: {:error, "Invalid worksheet index."}
+        else
+          {:error, "Invalid worksheet index."}
+        end
+      %XmlFile{} -> 
+        {:ok, found_file}
     end
   end
 
