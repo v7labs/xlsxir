@@ -261,77 +261,165 @@ defmodule Xlsxir do
         # Parse all worksheets in correct order
         results = XlsxFile.parse_all_to_ets(xlsx_file, timer)
         
-        # Clean up the unused reference to workbook
+        # Save the workbook information to a local variable before cleanup
+        workbook_name_mappings = extract_workbook_name_mappings(xlsx_file)
         
-        # Clean resources to free memory, but ensure we maintain workbook info
+        # Now it's safe to clean up resources
         XlsxFile.clean(xlsx_file)
         
-        # Ensure names are correctly assigned to all parsed worksheets
-        results
-        |> Enum.with_index(1)
+        # Use the stored workbook mappings instead of trying to access the cleaned ETS table
+        order_mappings = workbook_name_mappings
+          
+        # Ensure names are correctly assigned and preserve order
+        results_with_names = 
+          results
+          |> Enum.with_index(1)
+          |> Enum.map(fn
+            {{:ok, tid}, index} -> 
+              # Check if name is already properly set
+              current_name = get_info(tid, :name)
+              
+              # Only update if name is missing or nil
+              worksheet_name = 
+                if current_name == nil do
+                  # Try multiple lookup strategies to find the correct name
+                  sheet_filename = "sheet#{index}.xml"
+                  
+                  name = cond do
+                    # Try filename-based lookup first
+                    Map.has_key?(sheet_mappings[:filename_to_name] || %{}, sheet_filename) ->
+                      Map.get(sheet_mappings[:filename_to_name], sheet_filename)
+                      
+                    # Try position-based lookup
+                    sheet_id = Map.get(sheet_mappings[:position_to_id] || %{}, index) ->
+                      Map.get(sheet_mappings[:id_to_name] || %{}, sheet_id)
+                      
+                    # Direct position lookup
+                    Map.has_key?(sheet_mappings[:id_to_name] || %{}, index) -> 
+                      Map.get(sheet_mappings[:id_to_name], index)
+                      
+                    # Give up, can't find a name
+                    true -> nil
+                  end
+                  
+                  # Update the worksheet name if we found one
+                  if name, do: :ets.insert(tid, {:info, :worksheet_name, name})
+                  name
+                else
+                  current_name
+                end
+                
+              # Also store original worksheet order
+              if worksheet_name do
+                original_order = Map.get(order_mappings[:by_name] || %{}, worksheet_name, index)
+                :ets.insert(tid, {:info, :worksheet_order, original_order})
+              end
+              
+              {tid, worksheet_name, index}
+              
+            {{:ok, tid, time}, index} -> 
+              # Same logic as above but preserve timing information
+              current_name = get_info(tid, :name)
+              
+              worksheet_name = 
+                if current_name == nil do
+                  sheet_filename = "sheet#{index}.xml"
+                  
+                  name = cond do
+                    Map.has_key?(sheet_mappings[:filename_to_name] || %{}, sheet_filename) ->
+                      Map.get(sheet_mappings[:filename_to_name], sheet_filename)
+                      
+                    sheet_id = Map.get(sheet_mappings[:position_to_id] || %{}, index) ->
+                      Map.get(sheet_mappings[:id_to_name] || %{}, sheet_id)
+                      
+                    Map.has_key?(sheet_mappings[:id_to_name] || %{}, index) -> 
+                      Map.get(sheet_mappings[:id_to_name], index)
+                      
+                    true -> nil
+                  end
+                  
+                  if name, do: :ets.insert(tid, {:info, :worksheet_name, name})
+                  name
+                else
+                  current_name
+                end
+              
+              # Also store original worksheet order
+              if worksheet_name do
+                original_order = Map.get(order_mappings[:by_name] || %{}, worksheet_name, index)
+                :ets.insert(tid, {:info, :worksheet_order, original_order})
+              end
+              
+              {tid, worksheet_name, index, time}
+          end)
+          
+        # Now reformat the results to match expected return format, preserving order
+        results_with_names
         |> Enum.map(fn
-          {{:ok, tid}, index} -> 
-            # Check if name is already properly set
-            current_name = get_info(tid, :name)
-            
-            # Only update if name is missing or nil
-            if current_name == nil do
-              # Try multiple lookup strategies to find the correct name
-              sheet_filename = "sheet#{index}.xml"
-              
-              name = cond do
-                # Try filename-based lookup first
-                Map.has_key?(sheet_mappings[:filename_to_name] || %{}, sheet_filename) ->
-                  Map.get(sheet_mappings[:filename_to_name], sheet_filename)
-                  
-                # Try position-based lookup
-                sheet_id = Map.get(sheet_mappings[:position_to_id] || %{}, index) ->
-                  Map.get(sheet_mappings[:id_to_name] || %{}, sheet_id)
-                  
-                # Direct position lookup
-                Map.has_key?(sheet_mappings[:id_to_name] || %{}, index) -> 
-                  Map.get(sheet_mappings[:id_to_name], index)
-                  
-                # Give up, can't find a name
-                true -> nil
-              end
-              
-              # Update the worksheet name if we found one
-              if name, do: :ets.insert(tid, {:info, :worksheet_name, name})
-            end
-            
-            {:ok, tid}
-            
-          {{:ok, tid, time}, index} -> 
-            # Same logic as above but preserve timing information
-            current_name = get_info(tid, :name)
-            
-            if current_name == nil do
-              sheet_filename = "sheet#{index}.xml"
-              
-              name = cond do
-                Map.has_key?(sheet_mappings[:filename_to_name] || %{}, sheet_filename) ->
-                  Map.get(sheet_mappings[:filename_to_name], sheet_filename)
-                  
-                sheet_id = Map.get(sheet_mappings[:position_to_id] || %{}, index) ->
-                  Map.get(sheet_mappings[:id_to_name] || %{}, sheet_id)
-                  
-                Map.has_key?(sheet_mappings[:id_to_name] || %{}, index) -> 
-                  Map.get(sheet_mappings[:id_to_name], index)
-                  
-                true -> nil
-              end
-              
-              if name, do: :ets.insert(tid, {:info, :worksheet_name, name})
-            end
-            
-            {:ok, tid, time}
+          {tid, _, _, time} -> {:ok, tid, time}  # With timing
+          {tid, _, _} -> {:ok, tid}              # Without timing
         end)
     end
   end
 
   def multi_extract(path, index, timer, _excel, options) when is_integer(index) do
     extract(path, index, timer, options)
+  end
+  
+  # Helper to safely extract worksheet name and order mappings before cleanup
+  defp extract_workbook_name_mappings(xlsx_file) do
+    if xlsx_file.workbook && Enum.member?(:ets.all(), xlsx_file.workbook) do
+      # Get all regular number-based mappings - safely
+      num_mappings = 
+        try do
+          :ets.match(xlsx_file.workbook, {:'$1', :'$2'})
+          |> Enum.filter(fn [key, _] -> is_integer(key) end)
+          |> Enum.map(fn [key, val] -> {key, val} end)
+          |> Enum.into(%{})
+        rescue
+          _ -> %{}
+        end
+      
+      # Get all order-based mappings - safely
+      order_mappings = 
+        try do
+          :ets.match(xlsx_file.workbook, {:order, :'$1', :'$2'})
+          |> Enum.map(fn [order_index, name] -> {order_index, name} end)
+          |> Enum.into(%{})
+        rescue
+          _ -> %{}
+        end
+            
+      # Get all sheet name to order mappings - safely
+      name_to_order_mappings =
+        try do
+          :ets.match(xlsx_file.workbook, {:sheet_order, :'$1', :'$2'})
+          |> Enum.map(fn [name, order] -> {name, order} end)
+          |> Enum.into(%{})
+        rescue
+          _ -> %{}
+        end
+      
+      # Get all filename mappings - safely
+      filename_mappings =
+        try do
+          :ets.match(xlsx_file.workbook, {:filename, :'$1', :'$2'})
+          |> Enum.map(fn [filename, name] -> {filename, name} end)
+          |> Enum.into(%{})
+        rescue
+          _ -> %{}
+        end
+      
+      # Return comprehensive mappings
+      %{
+        id_to_name: num_mappings,
+        by_position: order_mappings,
+        by_name: name_to_order_mappings,
+        filename_to_name: filename_mappings
+      }
+    else
+      %{}
+    end
   end
 
   @doc """
@@ -613,13 +701,17 @@ defmodule Xlsxir do
 
       :name ->
         worksheet_name(tid)
+        
+      :order ->
+        worksheet_order(tid)
 
       _ ->
         [
           rows: row_num(tid),
           cols: col_num(tid),
           cells: cell_num(tid),
-          name: worksheet_name(tid)
+          name: worksheet_name(tid),
+          order: worksheet_order(tid)
         ]
     end
   end
@@ -641,10 +733,19 @@ defmodule Xlsxir do
   end
 
   defp worksheet_name(tid) do
-    List.foldl(:ets.lookup(tid, :info), nil, fn value, _ ->
+    List.foldl(:ets.lookup(tid, :info), nil, fn value, acc ->
       case value do
         {:info, :worksheet_name, name} -> name
-        _ -> nil
+        _ -> acc
+      end
+    end)
+  end
+  
+  defp worksheet_order(tid) do
+    List.foldl(:ets.lookup(tid, :info), nil, fn value, acc ->
+      case value do
+        {:info, :worksheet_order, order} -> order
+        _ -> acc
       end
     end)
   end
