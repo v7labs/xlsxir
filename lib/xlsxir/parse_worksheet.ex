@@ -40,14 +40,10 @@ defmodule Xlsxir.ParseWorksheet do
     {sheet_id, _} = Integer.parse(remained)
 
     worksheet_name =
-      List.foldl(:ets.lookup(workbook_tid, sheet_id), nil, fn value, _ ->
-        case value do
-          {_, worksheet_name} -> worksheet_name
-          _ -> nil
-        end
-      end)
-
-    # [{_, worksheet_name} | _] = :ets.lookup(workbook_tid, rid)
+      case :ets.lookup(workbook_tid, sheet_id) do
+        [{_, name}] -> name
+        _ -> nil
+      end
 
     :ets.insert(tid, {:info, :worksheet_name, worksheet_name})
 
